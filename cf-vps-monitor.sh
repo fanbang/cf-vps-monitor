@@ -32,6 +32,8 @@ DEFAULT_INTERVAL=10
 DEFAULT_WORKER_URL=""
 DEFAULT_SERVER_ID=""
 DEFAULT_API_KEY=""
+DEFAULT_REALTIME_PORT=8999
+DEFAULT_REALTIME_ENABLED=false
 
 # 打印带颜色的消息
 print_message() {
@@ -785,6 +787,8 @@ load_config() {
         SERVER_ID="$DEFAULT_SERVER_ID"
         API_KEY="$DEFAULT_API_KEY"
         INTERVAL="$DEFAULT_INTERVAL"
+        REALTIME_PORT="${REALTIME_PORT:-$DEFAULT_REALTIME_PORT}"
+        REALTIME_ENABLED="${REALTIME_ENABLED:-$DEFAULT_REALTIME_ENABLED}"
     fi
 }
 
@@ -806,6 +810,8 @@ WORKER_URL="$WORKER_URL"
 SERVER_ID="$SERVER_ID"
 API_KEY="$API_KEY"
 INTERVAL="$INTERVAL"
+REALTIME_PORT="${REALTIME_PORT:-$DEFAULT_REALTIME_PORT}"
+REALTIME_ENABLED="${REALTIME_ENABLED:-$DEFAULT_REALTIME_ENABLED}"
 EOF
     print_message "$GREEN" "配置已保存到 $CONFIG_FILE"
 }
@@ -1421,6 +1427,158 @@ get_uptime() {
     fi
 
     echo "$uptime_seconds"
+}
+
+# ==================== HTTP服务器功能 ====================
+
+# 启动HTTP服务器用于实时监控
+start_http_server() {
+    local port="${REALTIME_PORT:-8999}"
+    local pid_file="$SCRIPT_DIR/run/http-server.pid"
+    
+    # 检查是否已经运行
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "HTTP服务器已在运行 (PID: $pid, 端口: $port)"
+            return 0
+        else
+            rm -f "$pid_file"
+        fi
+    fi
+
+    # 检查端口是否被占用
+    if command_exists netstat; then
+        if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+            log "端口 $port 已被占用"
+            return 1
+        fi
+    fi
+
+    log "启动HTTP服务器，端口: $port"
+    
+    # 使用nc或socat启动简单HTTP服务器
+    if command_exists nc; then
+        start_nc_server "$port" "$pid_file" &
+    elif command_exists socat; then
+        start_socat_server "$port" "$pid_file" &
+    else
+        log "错误: 需要nc或socat来启动HTTP服务器"
+        return 1
+    fi
+    
+    local server_pid=$!
+    echo "$server_pid" > "$pid_file"
+    log "HTTP服务器已启动 (PID: $server_pid)"
+    return 0
+}
+
+# 使用nc启动HTTP服务器
+start_nc_server() {
+    local port="$1"
+    local pid_file="$2"
+    
+    while true; do
+        # 检查PID文件是否存在，如果不存在则退出
+        [[ ! -f "$pid_file" ]] && break
+        
+        # 使用nc监听请求
+        {
+            echo -e "HTTP/1.1 200 OK\r"
+            echo -e "Content-Type: application/json\r"
+            echo -e "Access-Control-Allow-Origin: *\r"
+            echo -e "Access-Control-Allow-Methods: GET, POST, OPTIONS\r"
+            echo -e "Access-Control-Allow-Headers: *\r"
+            echo -e "\r"
+            
+            # 获取实时监控数据
+            get_realtime_data
+        } | nc -l -p "$port" -q 1 2>/dev/null || sleep 1
+    done
+}
+
+# 使用socat启动HTTP服务器
+start_socat_server() {
+    local port="$1"
+    local pid_file="$2"
+    
+    while [[ -f "$pid_file" ]]; do
+        socat TCP-LISTEN:"$port",reuseaddr,fork EXEC:"$0 http-response" 2>/dev/null || sleep 1
+    done
+}
+
+# 停止HTTP服务器
+stop_http_server() {
+    local pid_file="$SCRIPT_DIR/run/http-server.pid"
+    
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            log "HTTP服务器已停止 (PID: $pid)"
+        fi
+        rm -f "$pid_file"
+    fi
+}
+
+# HTTP响应处理
+http_response() {
+    # 读取HTTP请求头
+    local request_line
+    read -r request_line
+    
+    # 解析请求方法和路径
+    local method path
+    read -r method path <<< "$request_line"
+    
+    # 跳过其他HTTP头
+    while read -r line && [[ "$line" != $'\r' && -n "$line" ]]; do
+        continue
+    done
+    
+    # 发送HTTP响应
+    echo -e "HTTP/1.1 200 OK\r"
+    echo -e "Content-Type: application/json\r"
+    echo -e "Access-Control-Allow-Origin: *\r"
+    echo -e "Access-Control-Allow-Methods: GET, POST, OPTIONS\r"
+    echo -e "Access-Control-Allow-Headers: *\r"
+    echo -e "\r"
+    
+    # 处理OPTIONS请求
+    if [[ "$method" == "OPTIONS" ]]; then
+        return 0
+    fi
+    
+    # 获取并返回实时数据
+    get_realtime_data
+}
+
+# 获取实时监控数据
+get_realtime_data() {
+    local timestamp=$(date +%s)
+    local cpu_raw=$(get_cpu_usage)
+    local memory_raw=$(get_memory_usage)
+    local disk_raw=$(get_disk_usage)
+    local network_raw=$(get_network_usage)
+    local uptime_raw=$(get_uptime)
+
+    # 验证运行时间
+    local uptime=$(sanitize_integer "$uptime_raw" "0")
+
+    # 清理JSON数据
+    cpu_raw=$(clean_json_string "$cpu_raw")
+    memory_raw=$(clean_json_string "$memory_raw")
+    disk_raw=$(clean_json_string "$disk_raw")
+    network_raw=$(clean_json_string "$network_raw")
+
+    # 简单验证JSON格式
+    [[ ! "$cpu_raw" =~ ^\{.*\}$ ]] && cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
+    [[ ! "$memory_raw" =~ ^\{.*\}$ ]] && memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    [[ ! "$disk_raw" =~ ^\{.*\}$ ]] && disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    [[ ! "$network_raw" =~ ^\{.*\}$ ]] && network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
+
+    # 构建完整的JSON响应
+    echo "{\"success\":true,\"data\":{\"server_id\":\"$SERVER_ID\",\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime}}"
 }
 
 # 验证和清理数值
@@ -2114,6 +2272,15 @@ start_service() {
         print_message "$GREEN" "✓ 监控服务已启动 (PID: $pid)"
         print_message "$CYAN" "日志文件: $LOG_FILE"
 
+        # 启动实时监控HTTP服务器（如果配置启用）
+        if [[ "${REALTIME_ENABLED:-false}" == "true" ]]; then
+            if start_http_server; then
+                print_message "$GREEN" "✓ 实时监控HTTP服务器已启动 (端口: ${REALTIME_PORT:-8999})"
+            else
+                print_message "$YELLOW" "⚠ 实时监控HTTP服务器启动失败"
+            fi
+        fi
+
         # 自动配置自启动设置
         echo
         add_autostart_settings
@@ -2218,10 +2385,13 @@ stop_service() {
         fi
     fi
 
-    # 3. 清理PID文件
+    # 3. 停止HTTP服务器
+    stop_http_server
+
+    # 4. 清理PID文件
     rm -f "$PID_FILE" 2>/dev/null || true
 
-    # 4. 结果报告和自启动清理
+    # 5. 结果报告和自启动清理
     if [[ "$stopped" == "true" ]]; then
         print_message "$GREEN" "✓ 监控服务已停止"
 
@@ -2668,6 +2838,36 @@ configure_monitor() {
     read -r input_url
     if [[ -n "$input_url" ]]; then
         WORKER_URL="$input_url"
+    fi
+
+    # 实时监控配置
+    echo
+    print_message "$CYAN" "实时监控配置:"
+    echo -n "是否启用实时监控接口? (y/N)"
+    if [[ "${REALTIME_ENABLED:-false}" == "true" ]]; then
+        echo -n " (当前: 已启用)"
+    else
+        echo -n " (当前: 已禁用)"
+    fi
+    echo -n ": "
+    read -r enable_realtime
+    if [[ "$enable_realtime" =~ ^[Yy]$ ]]; then
+        REALTIME_ENABLED="true"
+        
+        # 配置实时监控端口
+        echo -n "实时监控端口"
+        if [[ -n "$REALTIME_PORT" ]]; then
+            echo -n " (当前: $REALTIME_PORT)"
+        fi
+        echo -n " [8999]: "
+        read -r input_port
+        if [[ -n "$input_port" ]]; then
+            REALTIME_PORT="$input_port"
+        else
+            REALTIME_PORT="8999"
+        fi
+    else
+        REALTIME_ENABLED="false"
     fi
 
     # 设置默认上报间隔为10秒，脚本会自动从服务器获取最新配置
@@ -3204,6 +3404,10 @@ main() {
             ;;
         status)
             check_service_status
+            ;;
+        http-response)
+            load_config
+            http_response
             ;;
         logs)
             view_logs
